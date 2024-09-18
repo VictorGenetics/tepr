@@ -21,11 +21,14 @@ library("pracma")
 
 alldfpath <- "/g/romebioinfo/tmp/preprocessing/completeframedf.rds"
 exptabpath <- "/g/romebioinfo/Projects/tepr/downloads/annotations/exptab.csv" # nolint
+filtertabpath <- "/g/romebioinfo/Projects/tepr/Dataset/filtertab.csv"
+
 expthres <- 0.1
 ## Parallelization on bedgraph files. The maximum should be equal to the number of bedgraph files.  # nolint
 nbcpubg <- 8
 ## Parallelization on transcripts. The maximum should be limited to the capacity of your machine.  # nolint
 nbcputrans <- 20
+testonerep <- FALSE
 
 
 ##################
@@ -243,16 +246,21 @@ genesECDF <- function(allexprsdfs, expdf, rounding = 10, nbcpu = 1, # nolint
 
         meandifflist <- mapply(function(idxvalvec, idxname, df, nbwindows,
             currentcond, colnamevec, verbose) {
-            if (verbose)
+            if (verbose) {
               message("\t Calculating average and difference between ",
                 "replicates for columns '", idxname, "' of ", currentcond)
+              if (isTRUE(all.equal(length(idxvalvec), 1)))
+                warning("Only one replicate, copy scores to mean columns",
+                  immediate. = TRUE)
+            }
 
             ## Calculating the column of mean scores for currentcond
             ## The result is a data.frame made of a single column
-            if (length(idxvalvec) >= 2)
+            if (length(idxvalvec) >= 2) {
                 meandf <- data.frame(rowMeans(df[, idxvalvec], na.rm = FALSE))
-            else
-                meandf <- df[, idxvalvec]
+            } else {
+                meandf <- as.data.frame(df[, idxvalvec])
+            }
             colnames(meandf) <- paste0("mean_", idxname, "_", currentcond)
 
             if (isTRUE(all.equal(idxname, "Fx"))) {
@@ -287,8 +295,9 @@ createmeandiff <- function(resultsecdf, expdf, nbwindows, verbose = FALSE) {
         ## The difference is used to calculate the AUC later on
         colnamevec <- colnames(df)
         meandifflist <- .meandiffscorefx(idxcondlist, df, nbwindows,
-            currentcond, colnamevec, verbose)
+          currentcond, colnamevec, verbose)
         names(meandifflist) <- NULL
+
         meandiffres <- do.call("cbind", meandifflist)
         return(meandiffres)
     }, resultsecdf, nbwindows, verbose)
@@ -329,7 +338,7 @@ createmeandiff <- function(resultsecdf, expdf, nbwindows, verbose = FALSE) {
         return(infodf)
 }
 
-dauc_allconditions <- function(bytranslist, expdf, nbwindows, nbcpu = 1,
+.dauc_allconditions <- function(bytranslist, expdf, nbwindows, nbcpu = 1,
     dontcompare = NULL) {
 
     condvec <- unique(expdf$condition)
@@ -368,6 +377,15 @@ dauc_allconditions <- function(bytranslist, expdf, nbwindows, nbcpu = 1,
     }, condvec, mc.cores = nbcpu)
 
     resdf <- do.call("rbind", resdflist)
+
+    ## Correct p-values using FDR
+    idx <- grep("pvaldeltadaucks", colnames(resdf))
+    fdrvec <- p.adjust(resdf[, idx], method = "fdr")
+
+    resdf <- cbind(resdf, fdrvec)
+    colnamevec <- colnames(resdf)
+    idxfdr <- which(colnamevec == "fdrvec")
+    colnames(resdf)[idxfdr] <- paste0("adjFDR_", colnamevec[idx])
     return(resdf)
 }
 
@@ -388,7 +406,7 @@ dauc_allconditions <- function(bytranslist, expdf, nbwindows, nbcpu = 1,
     return(aucdf)
 }
 
-auc_allconditions <- function(bytranslist, expdf, nbwindows, nbcpu = 1) {
+.auc_allconditions <- function(bytranslist, expdf, nbwindows, nbcpu = 1) {
 
   cumulative <- seq(1, nbwindows) / nbwindows
   condvec <- unique(expdf$condition)
@@ -415,9 +433,50 @@ auc_allconditions <- function(bytranslist, expdf, nbwindows, nbcpu = 1) {
   }, condvec, cumulative, nbwindows, mc.cores = nbcpu)
 
   aucallconditions <- do.call("rbind", resdflist)
+  idxdup <- which(duplicated(colnames(aucallconditions)))
+  aucallconditions <- aucallconditions[, -idxdup]
+
+  ## Correcting p-val with FDR
+  idxpvalvec <- grep("pvalaucks", colnames(aucallconditions))
+  fdrlist <- lapply(idxpvalvec, function(idxpval, tab) {
+    return(p.adjust(tab[, idxpval], method = "fdr"))
+  }, aucallconditions)
+  fdrdf <- do.call("cbind", fdrlist)
+  colnames(fdrdf) <- paste0("adjFDR_", colnames(aucallconditions)[idxpvalvec]) # nolint
+
+  aucallconditions <- cbind(aucallconditions, fdrdf)
   return(aucallconditions)
 }
 
+allauc <- function(bytranslistmean, expdf, nbwindows, nbcputrans,
+  dontcompare = NULL, verbose = TRUE) {
+
+    if (verbose) message("\t Computing the differences (d or delta) of AUC")
+    start_time <- Sys.time()
+    daucallcond <- .dauc_allconditions(bytranslistmean, expdf, nbwindows,
+      nbcputrans)
+    end_time <- Sys.time()
+    if (verbose) message("\t\t ## Analysis performed in: ",
+      end_time - start_time) # nolint
+    #saveRDS(dfaucallcond, "/g/romebioinfo/tmp/downstream/dfaucallcond.rds") # nolint
+
+    ## Calculate the Area Under Curve (AUC), All conditions vs y=x
+    ## Calculate Mean Value over the full gene body in All conditions.
+    if (verbose) message("\t Computing the Area Under Curve (AUC)")
+    start_time <- Sys.time()
+    aucallcond <- .auc_allconditions(bytranslistmean, expdf, nbwindows,
+      nbcpu = nbcputrans)
+    end_time <- Sys.time()
+    if (verbose) message("\t\t ## Analysis performed in: ",
+      end_time - start_time) # nolint
+    #saveRDS(aucallcond, "/g/romebioinfo/tmp/downstream/aucallcond.rds") # nolint
+
+    ## Merging the two tables by transcript
+    if (verbose) message("Merging results")
+    allauc <- merge(aucallcond, daucallcond,
+      by = c("gene", "transcript", "strand"))
+    return(allauc)
+}
 
 
 countna <- function(allexprsdfs, expdf, nbcpu, verbose = FALSE) {
@@ -440,15 +499,23 @@ countna <- function(allexprsdfs, expdf, nbcpu, verbose = FALSE) {
         scoremat <- transtable[, colnamestr]
 
         ## Counting NA for each condition (c=condition, m=matrix, n=colnames)
-        res <- lapply(condvec, function(c, m, n) {
-          length(which(apply(m[, grep(c, n)], 1, function(x) all(is.na(x)))))
+        res <- sapply(condvec, function(c, m, n) {
+          idxcol <- grep(c, n)
+          if (!isTRUE(all.equal(length(idxcol), 1))) {
+            return(length(which(apply(m[, idxcol], 1,
+              function(x) all(is.na(x))))))
+          } else { ## Only one replicate
+            return(length(which(is.na(m[, idxcol]))))
+          }
         }, scoremat, colnamestr)
-        res <- do.call("cbind", res)
-        colnames(res) <- paste0(condvec, "_NA")
+
+        ## Retrieving total NA and transcript info
+        countna <- sum(res)
         info <- data.frame(gene = unique(transtable$gene),
           transcript = unique(transtable$transcript), strand = str)
-        return(cbind(info, res))
+        return(cbind(info, countna))
     }, scorecolvec, condvec, mc.cores = nbcpu)
+
   return(do.call("rbind", nabytranslist))
 }
 
@@ -457,20 +524,18 @@ countna <- function(allexprsdfs, expdf, nbcpu, verbose = FALSE) {
 .retrievekneeandmax <- function(condvec, transtable) { # nolint
 
   reslist <- lapply(condvec, function(cond, transtable) {
-
     difffxname <- paste0("diff_Fx_", cond)
     difffxvec <- transtable[, difffxname]
-
     ## If equality of difference within the same gene it takes the closest
     ## knee from the TSS # nolint
     resrow <- transtable[which(difffxvec == max(difffxvec)), ] %>% # nolint
           dplyr::slice_min(coord, n = 1) # nolint
     res <- data.frame(resrow$coord, resrow[, difffxname])
     colnames(res) <- c(paste0("knee_AUC_", cond), paste0("max_", difffxname))
-
     return(res)
-      }, transtable)
-    return(reslist)
+  }, transtable)
+
+  return(reslist)
 }
 
 kneeid <- function(transdflist, expdf, nbcputrans, verbose = FALSE) {
@@ -487,6 +552,214 @@ kneeid <- function(transdflist, expdf, nbcputrans, verbose = FALSE) {
 }
 
 
+.summarytrans <- function(bytransmeanlist, nbcpu) {
+  summarydflist <- mclapply(bytranslistmean, function(trans) {
+    coor1 <- min(trans$start)
+    coor2 <- max(trans$end)
+    return(data.frame(chr = trans$seqnames[1], coor1, coor2,
+          strand = trans$strand[1], gene = trans$gene[1],
+          transcript = trans$transcript[1], size = coor2 - coor1 + 1))
+  }, mc.cores = nbcpu)
+  summarydf <- do.call("rbind", summarydflist)
+  return(summarydf)
+}
+
+.computeupdown <- function(completbytrans, condvec, nbcpu) {
+
+  updownbytranslist <- mclapply(completbytrans, function(trans, condvec) {
+    ## For each condition
+    updownlist <- lapply(condvec, function(cond, trans) {
+      kneecolname <- paste0("knee_AUC_", cond)
+      meancolname <- paste0("mean_value_", cond)
+
+      idxup <- which(trans$coord <= trans[, kneecolname])
+      if (isTRUE(all.equal(length(idxup), 0)))
+        stop("Problem in retrieving idxup, contact the developer.")
+      upmean <- mean(trans[idxup, meancolname])
+
+      idxdown <- which(trans$coord >= trans[, kneecolname] &
+                          trans$coord <= max(trans$coord))
+      if (isTRUE(all.equal(length(idxdown), 0)))
+        stop("Problem in retrieving idxdown, contact the developer.")
+      downmean <- mean(trans[idxdown, meancolname])
+
+      ## Calculating attenuation
+      att <- 100 - downmean / upmean * 100
+
+      res <- data.frame(trans$transcript[1], upmean, downmean, att)
+      colnames(res) <- c("transcript", paste0("upmean-", cond),
+              paste0("downmean-", cond), paste0("attenuation-", cond))
+      return(res)
+    }, trans)
+
+    return(do.call("cbind", updownlist))
+  }, condvec, mc.cores = nbcpu)
+
+  updowndf <- do.call("rbind", updownbytranslist)
+  updowndf <- updowndf[, -which(duplicated(colnames(updowndf)))]
+  return(updowndf)
+}
+
+attenuation <- function(allaucdf, kneedf, matnatrans, bytranslistmean, expdf,
+  dfmeandiff, nbcpu = 1, verbose = TRUE) {
+
+      if (verbose) message("\t Merging tables")
+      allaucknee <- merge(allaucdf, kneedf, by = "transcript")
+      mergecolnames <- c("gene", "transcript", "strand")
+      allauckneena <- merge(allaucknee, matnatrans, by = mergecolnames)
+
+      if (verbose) message("\t Building summary")
+      summarydf <- .summarytrans(bytranslistmean, nbcpu)
+      if (verbose) message("\t Merging summary")
+      auckneenasum <- merge(summarydf, allauckneena, by = mergecolnames)
+
+      ## Merging the mean table with the previous one
+      if (verbose) message("\t Merging detailed mean table with summary")
+      complet <- merge(dfmeandiff, auckneenasum, by = mergecolnames)
+
+      ## Splitting the previous table by transcript
+      if (verbose) message("\t Splitting the previous table by transcript")
+      completbytrans <- split(complet, factor(complet$transcript))
+      condvec <- unique(expdf$condition)
+
+      ## For each transcript
+      if (verbose) message("\t Computing up and down mean")
+      updowndf <- .computeupdown(completbytrans, condvec, nbcpu)
+
+      ## Merging attenuation to the complete table
+      auckneenasumatt <- merge(auckneenasum, updowndf, by = "transcript")
+      return(auckneenasumatt)
+}
+
+
+.createboolmat <- function(tab, completedf) {
+
+  booleanlist <- apply(tab, 1, function(currentfilter, completedf) {
+
+    currentfeature <- as.character(currentfilter["feature"])
+
+    if (isTRUE(all.equal(currentfeature, "countna"))) {
+      return(as.vector(completedf["countna"] < currentfilter["threshold"]))
+
+    } else if (isTRUE(all.equal(currentfeature, "windowsize"))) {
+      return(as.vector(completedf["windsize"] > currentfilter["threshold"]))
+
+    } else if (isTRUE(all.equal(currentfeature, "fullmean"))) {
+      colstr <- paste0("meanvaluefull_", currentfilter["condition"])
+      return(completedf[, colstr] > currentfilter["threshold"])
+
+    } else if (isTRUE(all.equal(currentfeature, "pvalauc"))) {
+      colstr <- paste0("adjFDR_pvalaucks_", currentfilter["condition"]) # nolint
+      return(completedf[, colstr] > currentfilter["threshold"])
+
+    } else if (isTRUE(all.equal(currentfeature, "auc"))) {
+      colstr <- paste0("auc_", currentfilter["condition"])
+      if (!is.na(currentfilter["threshold2"]))
+        res <- completedf[, colstr] > currentfilter["threshold"] &
+          completedf[, colstr] < currentfilter["threshold2"]
+      else
+        res <- completedf[, colstr] > currentfilter["threshold"]
+      return(res)
+    } else if (isTRUE(all.equal(currentfeature, "daucfdrlog10"))) {
+      colnamevec <- colnames(completedf)
+      idx <- grep("adjFDR_pvaldeltadaucks_mean", colnamevec) # nolint
+      .checkunique(idx)
+      colstr <- colnamevec[idx]
+      return(-log10(completedf[, colstr]) > currentfilter["threshold"])
+    } else {
+      stop("The feature ", currentfeature, " is not handlded.",
+        "Allowed features are: countna, windowsize, fullmean, pvalauc, auc, ",
+        "and daucfdrlog10. If you are sure that there is no typo, contact the",
+        " developper.")
+    }
+  }, completedf, simplify = FALSE)
+
+  booleanmat <- do.call("cbind", booleanlist)
+  colnames(booleanmat) <- paste(tab[, "feature"], tab[, "condition"], sep = "-")
+  return(booleanmat)
+}
+
+universegroup <- function(completedf, expdf, filterdf, verbose = TRUE) {
+
+  ## Retrieving universe and group information
+  universetab <- filterdf[which(filterdf$universe), ]
+  grouptab <- filterdf[which(filterdf$group), ]
+
+  ## Creating bool matrix and vector for universe
+  universemat <- .createboolmat(universetab, completedf)
+  universevec <- apply(universemat, 1, all)
+
+  ## Creating bool matrix and vector for group
+  groupvec <- rep(NA, nrow(completedf))
+  groupmat <- .createboolmat(grouptab, completedf)
+  attenuatedcols <-  as.vector(apply(filterdf[which(filterdf$group.attenuated),
+    c("feature", "condition")], 1, paste, collapse = "-"))
+  outgroupcols <-  as.vector(apply(filterdf[which(filterdf$group.outgroup),
+    c("feature", "condition")], 1, paste, collapse = "-"))
+  attenuatedvec <- apply(cbind(universevec, groupmat[, attenuatedcols]), 1, all)
+  outgroupvec <- apply(cbind(universevec, groupmat[, outgroupcols]), 1, all)
+  if (any(attenuatedvec))
+    groupvec[attenuatedvec] <- "Attenuated"
+  else
+    warning("No attenuated genes were found")
+  if (any(outgroupvec))
+    groupvec[outgroupvec] <- "Outgroup"
+  else
+    warning("No outgroup genes were found")
+
+  ## Building the final data.frame
+  res <- data.frame(universe = universevec, group = groupvec)
+  unigroupdf <- cbind(res, completedf)
+
+  return(unigroupdf)
+}
+
+
+checkfilter <- function(filterdf, expdf) {
+
+  filtercond <- unique(filterdf$condition[!is.na(filterdf$condition)])
+  if (!isTRUE(all.equal(filtercond, unique(expdf$condition))))
+    stop("The condition column of your experiment and filter tab should",
+      " contain the same values.")
+
+  if (all(!filterdf$universe))
+    stop("All the rows of the universe column are set to FALSE. No rows will",
+      " be used for the analysis.")
+
+  if (all(!filterdf$group))
+    stop("All the rows of the group column are set to FALSE. No rows will",
+      " be used for the analysis.")
+
+  if (all(!filterdf$group.attenuated))
+    stop("All the rows of the group.attenuated column are set to FALSE. No ",
+      "rows will be used for the analysis.")
+
+    if (all(!filterdf$group.outgroup))
+    stop("All the rows of the group.attenuated column are set to FALSE. No ",
+      "rows will be used for the analysis.")
+
+  featurevec <- c("auc", "countna", "windowsize", "fullmean", "daucfdrlog10",
+    "pvalauc")
+  idx <- match(featurevec, filterdf$feature)
+  idxna <- which(is.na(idx))
+  if (!isTRUE(all.equal(length(idxna), 0)))
+    stop("The following features are missing from your filter table: ",
+      paste(featurevec[idxna], collapse = "-"))
+
+  colnametab <- colnames(filterdf)
+  colnamevec <- c("condition", "feature", "threshold", "threshold2", "universe",
+    "group", "group.attenuated", "group.outgroup")
+
+  if (any(duplicated(colnametab)))
+    stop("The columns of the filter table should be unique and must contain:",
+      paste(colnamevec, collapse = "-"))
+
+  idx <- match(colnamevec, colnametab)
+  idxna <- which(is.na(idx))
+  if (!isTRUE(all.equal(length(idxna), 0)))
+    stop("The following columns are missing from your filter table: ",
+      colnamevec[idxna])
+}
 
 
 ##################
@@ -496,6 +769,16 @@ kneeid <- function(transdflist, expdf, nbcputrans, verbose = FALSE) {
 ## Reading alldf and info tab
 alldf <- readRDS(alldfpath)
 expdf <- read.csv(exptabpath, header = TRUE)
+filterdf <- read.csv(filtertabpath, header = TRUE)
+checkfilter(filterdf, expdf)
+
+if (testonerep) {
+  ## Removing the second replicate
+  idxrep2 <- grep("ctrl2|HS2", colnames(alldf))
+  alldf <- alldf[, -idxrep2]
+  idxrep2 <- which(expdf$replicate == 2)
+  expdf <- expdf[-idxrep2, ]
+}
 
 ## Filtering out non expressed transcripts:
 ## 1) for each column, calculate the average expression per transcript (over each frame) # nolint
@@ -509,35 +792,37 @@ end_time <- Sys.time()
 message("\t\t ## Analysis performed in: ", end_time - start_time) # nolint
 resultsecdf <- resecdf[[1]]
 nbwindows <- resecdf[[2]]
-saveRDS(resultsecdf, "/g/romebioinfo/tmp/downstream/resultsecdf.rds")
+if (!testonerep) {
+  saveRDS(resultsecdf, "/g/romebioinfo/tmp/downstream/resultsecdf.rds")
+} else {
+  saveRDS(resultsecdf, "/g/romebioinfo/tmp/downstream/resultsecdf-onerep.rds")
+}
 
+## Calculating means and differences
 start_time <- Sys.time()
 message("Calculating means and differences")
 dfmeandiff <- createmeandiff(resultsecdf, expdf, nbwindows)
-saveRDS(dfmeandiff, "/g/romebioinfo/tmp/downstream/dfmeandiff.rds")
+if (!testonerep) {
+  saveRDS(dfmeandiff, "/g/romebioinfo/tmp/downstream/dfmeandiff.rds")
+} else {
+  saveRDS(dfmeandiff, "/g/romebioinfo/tmp/downstream/dfmeandiff-onerep.rds")
+}
 ## Splitting result by transcripts
 message("\t Splitting results by transcripts")
 bytranslistmean <- split(dfmeandiff, factor(dfmeandiff$transcript))
 end_time <- Sys.time()
 message("\t\t ## Analysis performed in: ", end_time - start_time) # nolint
 
-message("Computing the differences (d or delta) of AUC")
-start_time <- Sys.time()
-dfaucallcond <- dauc_allconditions(bytranslistmean, expdf, nbwindows,
-  nbcputrans)
-end_time <- Sys.time()
-message("\t\t ## Analysis performed in: ", end_time - start_time) # nolint
-saveRDS(dfaucallcond, "/g/romebioinfo/tmp/downstream/dfaucallcond.rds")
-
-# Calculate the Area Under Curve (AUC), All conditions vs y=x
-# Calculate Mean Value over the full gene body in All conditions.
-message("Computing the Area Under Curve (AUC)")
-start_time <- Sys.time()
-aucallcond <- auc_allconditions(bytranslistmean, expdf, nbwindows,
-  nbcpu = nbcputrans)
-end_time <- Sys.time()
-message("\t\t ## Analysis performed in: ", end_time - start_time) # nolint
-saveRDS(aucallcond, "/g/romebioinfo/tmp/downstream/aucallcond.rds")
+## Computing the differences (d or delta) of AUC and calculate the Area Under
+## Curve (AUC), All conditions vs y=x
+## Calculate Mean Value over the full gene body in All conditions.
+message("AUC and differences")
+allaucdf <- allauc(bytranslistmean, expdf, nbwindows, nbcputrans)
+if (!testonerep) {
+  saveRDS(allaucdf, "/g/romebioinfo/tmp/downstream/allaucdf.rds")
+} else {
+  saveRDS(allaucdf, "/g/romebioinfo/tmp/downstream/allaucdf-onerep.rds")
+}
 
 message("Calculating number of missing values for each transcript and for",
   " each condition")
@@ -545,134 +830,114 @@ start_time <- Sys.time()
 matnatrans <- countna(allexprsdfs, expdf, nbcputrans)
 end_time <- Sys.time()
 message("\t\t ## Analysis performed in: ", end_time - start_time) # nolint
-saveRDS(matnatrans, "/g/romebioinfo/tmp/downstream/matnatrans.rds")
+if (!testonerep) {
+  saveRDS(matnatrans, "/g/romebioinfo/tmp/downstream/matnatrans.rds")
+} else {
+  saveRDS(matnatrans, "/g/romebioinfo/tmp/downstream/matnatrans-onerep.rds")
+}
+
 
 message("Retrieving knee and max")
 start_time <- Sys.time()
 kneedf <- kneeid(bytranslistmean, expdf, nbcputrans)
 end_time <- Sys.time()
 message("\t\t ## Analysis performed in: ", end_time - start_time) # nolint
-saveRDS(kneedf, "/g/romebioinfo/tmp/downstream/kneedf.rds")
-
-
-
-!!!!!!!!!!!!!!!!!
-Attenuation_fun <- function(AUC_KS_Knee_NA_DF, concat_df, pval,Replaced) {
-
-  res <- getting_var_names(extension, file.path(working_directory, "bedgraphs"))
-  Conditions <- res$Conditions
-
-  Complete_summary <-  left_join(concat_df, AUC_KS_Knee_NA_DF,
-    by = c("gene","transcript","strand"))
-
-  for (cond in Conditions) {
-    mean_value_condi_name <- paste0("mean_value_", cond)
-    print(mean_value_condi_name)
-    knee_column_name <- paste0("knee_AUC_", cond)
-    Attenuation_cond <- paste0("Attenuation_", cond)
-    UPmean_cond <- paste0("UP_mean_", cond)
-    DOWNmean_cond <- paste0("DOWN_mean_", cond)
-    AUC_KS_Knee_NA_DF[[Attenuation_cond]] <- NA
-
-    result <- Complete_summary %>% group_by(transcript) %>% arrange(coord) %>%
-      dplyr::reframe(transcript=transcript[1],
-        !!sym(UPmean_cond) := mean((!!sym(mean_value_condi_name))[coord <= !!sym(knee_column_name)]), # nolint
-        !!sym(DOWNmean_cond) := mean((!!sym(mean_value_condi_name))[coord >= !!sym(knee_column_name) & coord <= max(coord)])) %>% # nolint
-        select(transcript,!!sym(UPmean_cond),!!sym(DOWNmean_cond), !!sym(DOWNmean_cond)) %>% distinct() # nolint
-
-    AUC_KS_Knee_NA_DF <- left_join(AUC_KS_Knee_NA_DF,result, by=c("transcript"))
-    AUC_KS_Knee_NA_DF[[Attenuation_cond]] <- 100 - AUC_KS_Knee_NA_DF[[DOWNmean_cond]]/AUC_KS_Knee_NA_DF[[UPmean_cond]]*100 # nolint
-  }
-
-  if (exists("Replaced") && !is.na(Replaced)) {
-    if (Replaced != "NOT") {
-      for (cond in Conditions) {
-        p_AUC_cond <- paste0("p_AUC_", cond)
-        print(p_AUC_cond)
-        AUC_KS_Knee_NA_DF <- AUC_KS_Knee_NA_DF %>%
-          mutate(!!paste0("Attenuation_", cond) := ifelse(.data[[p_AUC_cond]] >= pval, # nolint
-          Replaced, .data[[paste0("Attenuation_", cond)]])) ## replacing the Attenuation by an inout value is KS test > at threshold # nolint
-        AUC_KS_Knee_NA_DF <- AUC_KS_Knee_NA_DF %>%
-          mutate(!!paste0("knee_AUC_", cond) := ifelse(.data[[p_AUC_cond]] >= pval, NA, .data[[paste0("knee_AUC_", cond)]])) ## replacing the knee by NA is KS test > at threshold # nolint
-      }
-    }
-  } else {
-    for (cond in Conditions) {
-      p_AUC_cond <- paste0("p_AUC_", cond)
-      print(p_AUC_cond)
-      AUC_KS_Knee_NA_DF <- AUC_KS_Knee_NA_DF %>%
-        mutate(!!paste0("Attenuation_", cond) := ifelse(.data[[p_AUC_cond]] >= pval, NA, # nolint
-        .data[[paste0("Attenuation_", cond)]])) ## replacing the Attenuation by an input value if KS test > at threshold # nolint
-      AUC_KS_Knee_NA_DF <- AUC_KS_Knee_NA_DF %>%
-        mutate(!!paste0("knee_AUC_", cond) := ifelse(.data[[p_AUC_cond]] >= pval, NA, # nolint
-        .data[[paste0("knee_AUC_", cond)]])) ## replacing the knee by NA if KS test > at threshold # nolint
-    }
-  }
-  return(AUC_KS_Knee_NA_DF)
+if (!testonerep) {
+  saveRDS(kneedf, "/g/romebioinfo/tmp/downstream/kneedf.rds")
+} else {
+  saveRDS(kneedf, "/g/romebioinfo/tmp/downstream/kneedf-onerep.rds")
 }
 
-!!!!!!!!!!!!!!!!!!!
 
-> head(AUC_KS_Knee_NA.df,2)
-# A tibble: 2 × 27
-  transcript         chr    coor1  coor2 strand gene   size window_size AUC_ctrl
-  <chr>              <chr>  <int>  <int> <chr>  <chr> <dbl>       <int>    <dbl>
-1 ENST00000000233.10 chr7  1.28e8 1.28e8 +      ARF5   3290          16  -16.2
-2 ENST00000000412.8  chr12 8.94e6 8.95e6 -      M6PR   9285          46    0.432
-# ℹ 18 more variables: p_AUC_ctrl <dbl>, D_AUC_ctrl <dbl>,
-#   MeanValueFull_ctrl <dbl>, AUC_HS <dbl>, p_AUC_HS <dbl>, D_AUC_HS <dbl>,
-#   MeanValueFull_HS <dbl>, adjFDR_p_AUC_ctrl <dbl>, adjFDR_p_AUC_HS <dbl>,
-#   dAUC_Diff_meanFx_HS_ctrl <dbl>, p_dAUC_Diff_meanFx_HS_ctrl <dbl>,
-#   D_dAUC_Diff_meanFx_HS_ctrl <dbl>, adjFDR_p_dAUC_Diff_meanFx_HS_ctrl <dbl>,
-#   knee_AUC_ctrl <dbl>, max_diff_Fx_ctrl <dbl>, knee_AUC_HS <dbl>,
-#   max_diff_Fx_HS <dbl>, Count_NA <int>
+message("Calculating attenuation values")
+start_time <- Sys.time()
+completedf <- attenuation(allaucdf, kneedf, matnatrans, bytranslistmean, expdf,
+  dfmeandiff, nbcpu = nbcputrans)
+end_time <- Sys.time()
+message("\t\t ## Analysis performed in: ", end_time - start_time) # nolint
+if (!testonerep) {
+  saveRDS(completedf, "/g/romebioinfo/tmp/downstream/completedf.rds")
+} else {
+  saveRDS(completedf, "/g/romebioinfo/tmp/downstream/completedf-onerep.rds")
+}
 
-!!!!!!!!!!! SUMMARY IN ONE TABLE OF ALL THE VALUES COMPUTED ABOVE
-> head(tst_df,2)
-# A tibble: 2 × 33
-  transcript         chr    coor1  coor2 strand gene   size window_size AUC_ctrl
-  <chr>              <chr>  <int>  <int> <chr>  <chr> <dbl>       <int>    <dbl>
-1 ENST00000000233.10 chr7  1.28e8 1.28e8 +      ARF5   3290          16  -16.2
-2 ENST00000000412.8  chr12 8.94e6 8.95e6 -      M6PR   9285          46    0.432
-# ℹ 24 more variables: p_AUC_ctrl <dbl>, D_AUC_ctrl <dbl>,
-#   MeanValueFull_ctrl <dbl>, AUC_HS <dbl>, p_AUC_HS <dbl>, D_AUC_HS <dbl>,
-#   MeanValueFull_HS <dbl>, adjFDR_p_AUC_ctrl <dbl>, adjFDR_p_AUC_HS <dbl>,
-#   dAUC_Diff_meanFx_HS_ctrl <dbl>, p_dAUC_Diff_meanFx_HS_ctrl <dbl>,
-#   D_dAUC_Diff_meanFx_HS_ctrl <dbl>, adjFDR_p_dAUC_Diff_meanFx_HS_ctrl <dbl>,
-#   knee_AUC_ctrl <dbl>, max_diff_Fx_ctrl <dbl>, knee_AUC_HS <dbl>,
-#   max_diff_Fx_HS <dbl>, Count_NA <int>, Attenuation_ctrl <dbl>, …
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+unigroupdf <- readRDS("/g/romebioinfo/tmp/downstream/unigroupdf.rds")
+completedf <- readRDS("/g/romebioinfo/tmp/downstream/completedf.rds")
+tst_df <- readRDS("/g/romebioinfo/tmp/explore/tst_df-1.rds")
 
-!!!!!!!!!!!!!!! THIS ENABLES A FILTERING ON NA, WINDOWSIZE, ETC
-!!!!!!!!!!!!!!!!!! SEE IF CAN BE INTEGRATED SOMEWHERE
-> mean_value_control_full <- "MeanValueFull_ctrl"
+
+####### With tst_df
+mean_value_control_full <- "MeanValueFull_ctrl"
 mean_value_stress <- "MeanValueFull_HS"
 AUC_ctrl <- "AUC_ctrl"
 AUC_stress <- "AUC_HS"
 p_value_KStest <- "adjFDR_p_dAUC_Diff_meanFx_HS_ctrl"
 p_value_theoritical<- "adjFDR_p_AUC_ctrl"
-tst_df <- tst_df %>%
+
+tstdf <- tst_df %>%
   mutate(Universe = ifelse(window_size > 50 & Count_NA < 20 &
     !!sym(mean_value_control_full) > 0.5 & !!sym(mean_value_stress) > 0.5 &
     !!sym(p_value_theoritical)> 0.1, TRUE, FALSE)) %>%
   relocate(Universe, .before = 1)
-tst_df <- tst_df %>% mutate(
+
+tstdf <- tstdf %>% mutate(
     Group = ifelse(Universe == TRUE & !!sym(AUC_stress) > 15 & -log10(!!sym(p_value_KStest)) >1.5, "Attenuated", NA), # nolint
     Group = ifelse(Universe == TRUE & !!sym(p_value_KStest)>0.2 & !!sym(AUC_ctrl) > -10 & !!sym(AUC_ctrl) < 15 , "Outgroup", Group) # nolint
   ) %>% relocate(Group, .before = 2)
-> head(tst_df)
-# A tibble: 6 × 35
-  Universe Group   transcript chr    coor1  coor2 strand gene   size window_size
-  <lgl>    <chr>   <chr>      <chr>  <int>  <int> <chr>  <chr> <dbl>       <int>
-1 FALSE    NA      ENST00000… chr7  1.28e8 1.28e8 +      ARF5   3290          16
-2 FALSE    NA      ENST00000… chr12 8.94e6 8.95e6 -      M6PR   9285          46
-3 TRUE     Outgro… ENST00000… chr11 6.43e7 6.43e7 +      ESRRA 11220          56
-4 TRUE     Outgro… ENST00000… chr12 2.79e6 2.81e6 +      FKBP4 10454          52
-5 FALSE    NA      ENST00000… chr2  7.21e7 7.21e7 -      CYP2… 18625          93
-6 TRUE     Outgro… ENST00000… chr2  3.72e7 3.72e7 +      NDUF… 17503          87
-# ℹ 25 more variables: AUC_ctrl <dbl>, p_AUC_ctrl <dbl>, D_AUC_ctrl <dbl>,
-#   MeanValueFull_ctrl <dbl>, AUC_HS <dbl>, p_AUC_HS <dbl>, D_AUC_HS <dbl>,
-#   MeanValueFull_HS <dbl>, adjFDR_p_AUC_ctrl <dbl>, adjFDR_p_AUC_HS <dbl>,
-#   dAUC_Diff_meanFx_HS_ctrl <dbl>, p_dAUC_Diff_meanFx_HS_ctrl <dbl>,
-#   D_dAUC_Diff_meanFx_HS_ctrl <dbl>, adjFDR_p_dAUC_Diff_meanFx_HS_ctrl <dbl>,
-#   knee_AUC_ctrl <dbl>, max_diff_Fx_ctrl <dbl>, knee_AUC_HS <dbl>,
-#   max_diff_Fx_HS <dbl>, Count_NA <int>, Attenuation_ctrl <dbl>, …
+
+> print(table(tstdf$Universe))
+
+FALSE  TRUE
+ 8373  6612
+> print(table(tstdf$Group))
+
+Attenuated   Outgroup
+       513       5374
+
+####### With completedf
+
+mean_value_control_full <- "meanvaluefull_ctrl"
+mean_value_stress <- "meanvaluefull_HS"
+AUC_ctrl <- "auc_ctrl"
+AUC_stress <- "auc_HS"
+p_value_KStest <- "adjFDR_pvaldeltadaucks_mean_Fx_HS"
+p_value_theoritical<- "adjFDR_pvalaucks_ctrl"
+
+completetstdf <- completedf %>%
+  mutate(Universe = ifelse(windsize > 50 & countna < 20 &
+    !!sym(mean_value_control_full) > 0.5 & !!sym(mean_value_stress) > 0.5 &
+    !!sym(p_value_theoritical)> 0.1, TRUE, FALSE)) %>%
+  relocate(Universe, .before = 1)
+
+completetstdf <- completetstdf %>% mutate(
+    Group = ifelse(Universe == TRUE & !!sym(AUC_stress) > 15 & -log10(!!sym(p_value_KStest)) >1.5, "Attenuated", NA), # nolint
+    Group = ifelse(Universe == TRUE & !!sym(p_value_KStest)>0.2 & !!sym(AUC_ctrl) > -10 & !!sym(AUC_ctrl) < 15 , "Outgroup", Group) # nolint
+  ) %>% relocate(Group, .before = 2)
+
+> print(table(completetstdf$Universe))
+FALSE  TRUE
+13777  1299
+> print(table(completetstdf$Group))
+Attenuated   Outgroup
+       108       1014
+
+## check unigroupdf
+> print(table(unigroupdf$universe))
+FALSE  TRUE
+13095  1981
+> print(table(unigroupdf$group))
+Attenuated   Outgroup
+      1096        885
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+message("Filtering results")
+start_time <- Sys.time()
+unigroupdf <- universegroup(completedf, expdf, filterdf)
+end_time <- Sys.time()
+message("\t\t ## Analysis performed in: ", end_time - start_time) # nolint
+if (!testonerep) {
+  saveRDS(unigroupdf, "/g/romebioinfo/tmp/downstream/unigroupdf.rds")
+} else {
+  saveRDS(unigroupdf, "/g/romebioinfo/tmp/downstream/unigroupdf-onerep.rds")
+}
